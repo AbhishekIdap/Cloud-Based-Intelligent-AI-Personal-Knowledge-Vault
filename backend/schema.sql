@@ -1,0 +1,222 @@
+-- ============================================================================
+-- LifeGraph — PostgreSQL schema
+-- ============================================================================
+-- This mirrors the data model used by the LifeGraph.jsx prototype exactly —
+-- same categories, same collection/file/reminder/notification shape — so the
+-- frontend can be pointed at a real API on top of this schema with minimal
+-- rework. The prototype currently keeps this same shape in browser storage;
+-- swapping in this schema + an API layer is the path to a real backend.
+--
+-- Target: PostgreSQL 14+
+-- Later move to cloud storage: file BYTES belong in object storage (S3-
+-- compatible), not in Postgres — this schema stores metadata + a
+-- `storage_url` pointer, never raw file bytes.
+-- ============================================================================
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "citext";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+
+-- ----------------------------------------------------------------------------
+-- Users
+-- ----------------------------------------------------------------------------
+CREATE TABLE users (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name              TEXT NOT NULL,
+  email             CITEXT UNIQUE NOT NULL,
+  password_hash     TEXT NOT NULL,           -- bcrypt/argon2 hash, never plaintext
+  avatar_initials   TEXT,
+  avatar_color      TEXT DEFAULT 'sage',     -- sage | clay | gold | rose
+  plan              TEXT DEFAULT 'LifeGraph Personal',
+  storage_cap_kb    BIGINT NOT NULL DEFAULT (15 * 1024 * 1024), -- 15 GB default
+  theme             TEXT NOT NULL DEFAULT 'light',              -- light | dark
+  show_hidden       BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Note: CITEXT requires `CREATE EXTENSION IF NOT EXISTS citext;` — add if unavailable,
+-- or swap the column to TEXT + a unique index on lower(email).
+
+-- ----------------------------------------------------------------------------
+-- Notification preferences (one row per user; mirrors settings.notifications)
+-- ----------------------------------------------------------------------------
+CREATE TABLE notification_preferences (
+  user_id                 UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  uploads                 BOOLEAN NOT NULL DEFAULT TRUE,
+  reminders               BOOLEAN NOT NULL DEFAULT TRUE,
+  collection_activity     BOOLEAN NOT NULL DEFAULT TRUE,
+  security                BOOLEAN NOT NULL DEFAULT TRUE,
+  weekly_digest           BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+-- ----------------------------------------------------------------------------
+-- Collections (user-created groupings: "College Details", "Goa Trip", etc.)
+-- ----------------------------------------------------------------------------
+CREATE TABLE collections (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name          TEXT NOT NULL,
+  description   TEXT DEFAULT '',
+  icon          TEXT DEFAULT '📁',           -- emoji shorthand, matches the UI picker
+  color         TEXT DEFAULT 'sage',          -- sage | clay | gold | rose
+  keywords      TEXT[] DEFAULT '{}',          -- used for AI/keyword-based auto-filing
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_collections_user ON collections(user_id);
+
+-- ----------------------------------------------------------------------------
+-- Files — every note/document/pdf/photo/video/recording lives here.
+-- ----------------------------------------------------------------------------
+CREATE TYPE file_category AS ENUM ('note', 'document', 'pdf', 'photo', 'video', 'recording');
+
+CREATE TABLE files (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id           UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  collection_id     UUID REFERENCES collections(id) ON DELETE SET NULL,
+  name              TEXT NOT NULL,
+  category          file_category NOT NULL,
+  category_source   TEXT NOT NULL DEFAULT 'rule_based',  -- 'rule_based' | 'ai' | 'user' — how it got this category
+  size_kb           BIGINT NOT NULL DEFAULT 0,
+  storage_url       TEXT,                     -- pointer into object storage (S3 etc.); NULL until uploaded
+  thumbnail_url     TEXT,                     -- optional small preview, object storage pointer
+  mime_type         TEXT,
+  note_content      TEXT,                     -- body text, used when category = 'note'
+  description       TEXT,                     -- user-written, searchable note about ANY file (e.g. "screenshot of the Feb electricity bill") — see files.js
+  ai_summary        TEXT,                     -- auto-generated by Gemini after upload from the file's actual contents, so search finds it even with no manual description — see lib/summarize.js
+  ai_summary_status TEXT NOT NULL DEFAULT 'skipped', -- 'pending' | 'done' | 'failed' | 'skipped' (unsupported file type or no AI key configured)
+  starred           BOOLEAN NOT NULL DEFAULT FALSE,
+  hidden            BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  viewed_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_files_user ON files(user_id);
+CREATE INDEX idx_files_collection ON files(collection_id);
+CREATE INDEX idx_files_category ON files(user_id, category);
+CREATE INDEX idx_files_starred ON files(user_id, starred) WHERE starred = TRUE;
+CREATE INDEX idx_files_hidden ON files(user_id, hidden) WHERE hidden = TRUE;
+CREATE INDEX idx_files_name_trgm ON files USING gin (name gin_trgm_ops); -- requires pg_trgm, for fuzzy/"AI" search
+CREATE INDEX idx_files_description_trgm ON files USING gin (description gin_trgm_ops);
+CREATE INDEX idx_files_ai_summary_trgm ON files USING gin (ai_summary gin_trgm_ops);
+-- CREATE EXTENSION IF NOT EXISTS pg_trgm;  -- run once per database, needed for the indexes above
+
+-- ----------------------------------------------------------------------------
+-- Reminders
+-- ----------------------------------------------------------------------------
+CREATE TABLE reminders (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title         TEXT NOT NULL,
+  due_at        TIMESTAMPTZ NOT NULL,
+  done          BOOLEAN NOT NULL DEFAULT FALSE,
+  related_file_id       UUID REFERENCES files(id) ON DELETE SET NULL,
+  related_collection_id UUID REFERENCES collections(id) ON DELETE SET NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_reminders_user_due ON reminders(user_id, due_at) WHERE done = FALSE;
+
+-- ----------------------------------------------------------------------------
+-- Notifications (bell icon feed)
+-- ----------------------------------------------------------------------------
+CREATE TYPE notification_kind AS ENUM ('upload', 'reminder', 'storage', 'collection', 'digest', 'security');
+
+CREATE TABLE notifications (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind          notification_kind NOT NULL,
+  title         TEXT NOT NULL,
+  body          TEXT NOT NULL,
+  read          BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_notifications_user_unread ON notifications(user_id, read) WHERE read = FALSE;
+
+-- ----------------------------------------------------------------------------
+-- AI assistant chat history (for the AI Assistant page — optional but useful
+-- once real model calls replace the rule-based responder)
+-- ----------------------------------------------------------------------------
+CREATE TABLE assistant_messages (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role          TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+  content       TEXT NOT NULL,
+  referenced_file_ids UUID[] DEFAULT '{}',    -- files shown alongside this message, if any
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_assistant_messages_user ON assistant_messages(user_id, created_at);
+
+-- ----------------------------------------------------------------------------
+-- Audit trail for security-relevant events (password changes, exports, etc.)
+-- Powers the "security" notification kind and any future account-activity view.
+-- ----------------------------------------------------------------------------
+CREATE TABLE account_events (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  event_type    TEXT NOT NULL,                -- 'password_change' | 'login' | 'data_export' | ...
+  metadata      JSONB DEFAULT '{}',
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ----------------------------------------------------------------------------
+-- Helper view: storage usage by category, per user (backs the Settings →
+-- Storage donut chart and the Vault sidebar panel)
+-- ----------------------------------------------------------------------------
+CREATE VIEW storage_by_category AS
+SELECT
+  user_id,
+  category,
+  COUNT(*)              AS file_count,
+  COALESCE(SUM(size_kb), 0) AS total_kb
+FROM files
+GROUP BY user_id, category;
+
+-- ----------------------------------------------------------------------------
+-- updated_at auto-touch triggers
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_users_updated_at BEFORE UPDATE ON users
+  FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+CREATE TRIGGER trg_collections_updated_at BEFORE UPDATE ON collections
+  FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+CREATE TRIGGER trg_files_updated_at BEFORE UPDATE ON files
+  FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- ============================================================================
+-- Notes for whoever builds the API layer on top of this:
+--
+-- 1. Auto-categorization (categorizeFile in the frontend prototype) should
+--    move server-side once real AI is wired in — the client can keep doing
+--    the instant rule-based guess for a snappy UI, but the server should be
+--    the source of truth and may override it (write to category_source='ai').
+--
+-- 2. `keywords` on collections is what suggestCollection() matches against
+--    client-side today. A real implementation would replace that call with
+--    an embedding-similarity lookup (e.g. pgvector) against collection
+--    name+description+existing file names — the `keywords` column can stay
+--    as a manual override/boost signal even after that lands.
+--
+-- 3. Files never store bytes here — `storage_url` should point at S3 (or
+--    equivalent). Generate presigned upload URLs from the API, write the
+--    row after the client confirms the upload succeeded.
+--
+-- 4. `storage_cap_kb` on users is a simple quota; enforce it at the API layer
+--    before issuing a presigned upload URL, not just in the UI.
+--
+-- 5. `description` (manual) and `ai_summary` (automatic, written by
+--    lib/summarize.js right after upload) exist so search has more to match
+--    against than just the file name — this is what lets ten screenshots
+--    named "Screenshot 2026-01-28 192830.png" etc. still be findable by what
+--    they actually contain. `files.js`'s q= search and the assistant's
+--    search_files tool both match name OR description OR ai_summary OR
+--    note_content. ai_summary_status lets the UI show "Reading this file…"
+--    while the background job runs, without blocking the upload response.
+-- ============================================================================
