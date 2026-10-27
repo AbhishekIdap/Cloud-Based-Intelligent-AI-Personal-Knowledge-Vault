@@ -1,8 +1,3 @@
-// Applies schema.sql against DATABASE_URL. Safe-ish to re-run: the DDL uses
-// CREATE TABLE/TYPE without IF NOT EXISTS in a few spots (matching the
-// original schema.sql exactly), so on a fresh database only. For repeat
-// runs, drop the database or wrap statements in your own migration tool
-// (e.g. node-pg-migrate) once you outgrow this script.
 require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
